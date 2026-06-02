@@ -4187,3 +4187,138 @@ fn test_genesis_bootstrap_exit_rejects_overpull() {
     );
     assert_eq!(env.percolator_insurance_balance(&slab), 2, "market untouched on rejected over-pull");
 }
+
+// ============================================================================
+// Live-window self-service exit: pro-rata, order-independent, no dilution.
+// ============================================================================
+
+/// Faithful insurance loss: debit the internal insurance counter, per-domain
+/// budgets, aggregate vault counter, and the collateral token vault in lockstep
+/// (the state Percolator's loss waterfall actually produces — losses hit insurance
+/// first). Backing is left intact. `loss` <= current insurance.
+fn faithful_insurance_loss(env: &mut TestEnv, slab: &Pubkey, percolator_vault: &Pubkey, loss: u128) {
+    let mut slab_account = env.svm.get_account(slab).expect("slab");
+    {
+        let (_, mut group) =
+            percolator_prog::state::market_view_mut(&mut slab_account.data).expect("view");
+        let new_ins = group.header.insurance.get() - loss;
+        let new_vault = group.header.vault.get() - loss;
+        group.header.insurance = percolator_prog::risk::V16PodU128::new(new_ins);
+        group.header.vault = percolator_prog::risk::V16PodU128::new(new_vault);
+        let slot = &mut group.markets[0].engine;
+        slot.insurance_domain_budget_long = percolator_prog::risk::V16PodU128::new(new_ins / 2);
+        slot.insurance_domain_budget_short =
+            percolator_prog::risk::V16PodU128::new(new_ins - new_ins / 2);
+    }
+    env.svm.set_account(*slab, slab_account).unwrap();
+    let token = env.read_token_balance(percolator_vault);
+    env.set_token_balance_for_test(percolator_vault, token - loss as u64);
+}
+
+/// Submit a self-service market-pull exit and return (ok, amount recovered).
+fn self_service_exit(
+    env: &mut TestEnv,
+    user: &Keypair,
+    slab: &Pubkey,
+    percolator_vault: &Pubkey,
+    insurance_pull: u64,
+    backing_pull: u64,
+) -> (bool, u64) {
+    let mint = env.collateral_mint;
+    let dest = env.create_ata(&mint, &user.pubkey(), 0);
+    let (pvp, _) = Pubkey::find_program_address(&[b"vault", slab.as_ref()], &env.percolator_id);
+    let ix = Instruction {
+        program_id: env.rewards_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new_readonly(env.coin_mint, false),
+            AccountMeta::new_readonly(env.coin_cfg_pda(), false),
+            AccountMeta::new(env.genesis_cfg_pda(), false),
+            AccountMeta::new(env.genesis_position_pda(&user.pubkey()), false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new(env.genesis_vault_pda(), false),
+            AccountMeta::new_readonly(env.market_admin_pda(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(*slab, false),
+            AccountMeta::new(*percolator_vault, false),
+            AccountMeta::new_readonly(pvp, false),
+            AccountMeta::new_readonly(env.percolator_id, false),
+        ],
+        data: encode_genesis_bootstrap_withdraw(0, insurance_pull, backing_pull),
+    };
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[ComputeBudgetInstruction::set_compute_unit_limit(1_400_000), ix],
+        Some(&user.pubkey()), &[user], env.svm.latest_blockhash());
+    let ok = env.svm.send_transaction(tx).is_ok();
+    (ok, env.read_token_balance(&dest))
+}
+
+/// Under a 50% loss, two equal depositors each recover their FAIR pro-rata share
+/// via self-service exit during the live window — not first-mover-takes-all — and
+/// re-withdrawing pays nothing.
+#[test]
+fn test_live_window_exit_is_pro_rata_and_order_independent() {
+    let mut env = TestEnv::new();
+    env.init_coin_config_with_delay(50);
+    env.init_genesis_bootstrap(100);
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    for kp in [&alice, &bob] { env.svm.airdrop(&kp.pubkey(), 10_000_000_000).unwrap(); }
+    env.genesis_deposit(&alice, 2);
+    env.genesis_deposit(&bob, 2);
+    let (slab, percolator_vault) = env.init_futarchy_percolator_market();
+    env.kickstart_genesis_market(&slab, &percolator_vault);
+    assert_eq!(env.read_token_balance(&percolator_vault), 4, "deployed 4");
+
+    // Faithful 50% loss: insurance (2) wiped, backing (2) survives.
+    faithful_insurance_loss(&mut env, &slab, &percolator_vault, 2);
+    assert_eq!(env.percolator_insurance_balance(&slab), 0, "insurance wiped");
+
+    env.set_clock(150);
+    env.activate_live();
+
+    // Alice exits FIRST, pulling the surviving backing. She gets her fair 50% (1),
+    // not the full principal — the rest stays in the shared vault.
+    let (a_ok, alice_got) = self_service_exit(&mut env, &alice, &slab, &percolator_vault, 0, 2);
+    assert!(a_ok, "alice exit succeeds");
+    assert_eq!(alice_got, 1, "first mover gets her fair 50% share, not 100%");
+
+    // Looping pays nothing (full claim settled).
+    let (_, alice_again) = self_service_exit(&mut env, &alice, &slab, &percolator_vault, 0, 0);
+    assert_eq!(alice_again, 0, "re-withdraw pays nothing");
+
+    // Bob exits SECOND. The market is drained, so he pulls 0 and claims his vault
+    // share — the SAME fair 1. He is not wiped out.
+    let (b_ok, bob_got) = self_service_exit(&mut env, &bob, &slab, &percolator_vault, 0, 0);
+    assert!(b_ok, "bob can still exit (zero-pull, claims vault share)");
+    assert_eq!(bob_got, 1, "straggler recovers the same fair 50% share");
+}
+
+/// Healthy market: self-service exit still returns FULL principal (no dilution from
+/// counting only the vault — the still-in-market funds count toward the pool).
+#[test]
+fn test_live_window_exit_healthy_returns_full_principal() {
+    let mut env = TestEnv::new();
+    env.init_coin_config_with_delay(50);
+    env.init_genesis_bootstrap(100);
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    for kp in [&alice, &bob] { env.svm.airdrop(&kp.pubkey(), 10_000_000_000).unwrap(); }
+    env.genesis_deposit(&alice, 2);
+    env.genesis_deposit(&bob, 2);
+    let (slab, percolator_vault) = env.init_futarchy_percolator_market();
+    env.kickstart_genesis_market(&slab, &percolator_vault); // insurance 2, backing 2
+    env.set_clock(150);
+    env.activate_live();
+
+    // Alice pulls her principal worth (1 insurance + 1 backing) and gets her full 2,
+    // even though bob's 2 is still deployed (outstanding=4).
+    let (a_ok, alice_got) = self_service_exit(&mut env, &alice, &slab, &percolator_vault, 1, 1);
+    assert!(a_ok, "alice exit succeeds");
+    assert_eq!(alice_got, 2, "healthy market returns full principal, no dilution");
+
+    let (b_ok, bob_got) = self_service_exit(&mut env, &bob, &slab, &percolator_vault, 1, 1);
+    assert!(b_ok, "bob exit succeeds");
+    assert_eq!(bob_got, 2, "bob also recovers full principal");
+}
