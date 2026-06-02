@@ -2002,15 +2002,16 @@ fn process_genesis_withdraw<'a>(
                 .ok_or(ProgramError::ArithmeticOverflow)?;
         }
     } else {
-        // Capital is deployed in the market: pull the depositor's principal back
-        // from the insurance fund and backing bucket, then pay them.
+        // Live decision window (kicked, not finalized): self-service exit. Pull the
+        // requested insurance/backing into the SHARED vault, then pay a pro-rata
+        // share of the total recoverable pool (vault + what is still in the market)
+        // and settle the FULL claim — so the payout is order-independent and
+        // loop-proof and a first mover can no longer take par and short later
+        // depositors under loss. A pull of 0 is allowed: claim your vault share even
+        // after others have already drained the market.
         let total_pull = insurance_pull
             .checked_add(backing_pull)
             .ok_or(ProgramError::ArithmeticOverflow)?;
-        if total_pull == 0 {
-            msg!("specify insurance/backing amounts to recover from the market");
-            return Err(ProgramError::InvalidInstructionData);
-        }
         if total_pull > remaining {
             msg!("cannot recover more than the remaining principal");
             return Err(ProgramError::InvalidInstructionData);
@@ -2039,7 +2040,6 @@ fn process_genesis_withdraw<'a>(
             &cfg.base_mint,
         )?;
 
-        let vault_before = load_token_account(genesis_vault)?.amount;
         if insurance_pull > 0 {
             genesis_pull_from_market(
                 GENESIS_RECOVER_INSURANCE_LIMITED,
@@ -2070,35 +2070,66 @@ fn process_genesis_withdraw<'a>(
                 &signer_seeds,
             )?;
         }
-        let vault_after = load_token_account(genesis_vault)?.amount;
-        let recovered = vault_after.saturating_sub(vault_before);
-        let actual = core::cmp::min(recovered, remaining);
-        if actual > 0 {
-            let xfer_ix = spl_token::instruction::transfer(
-                token_program.key,
-                genesis_vault.key,
-                user_base_ata.key,
-                market_admin.key,
-                &[],
-                actual,
-            )?;
-            invoke_signed(
-                &xfer_ix,
-                &[
-                    genesis_vault.clone(),
-                    user_base_ata.clone(),
-                    market_admin.clone(),
-                    token_program.clone(),
-                ],
-                &[&signer_seeds],
-            )?;
+        // Pay a pro-rata share of the FULL recoverable pool and settle the FULL
+        // claim. The pool = the shared vault (now holding this pull) + whatever is
+        // still in the market; the pull only moves funds between the two, so the pool
+        // is conserved and `payout = remaining * pool / outstanding` keeps the
+        // pool/outstanding ratio invariant across withdrawals. That makes exits
+        // order-independent and loop-proof, and removes the par first-mover advantage
+        // — while leaving the self-service pull intact (a healthy market still
+        // returns full principal, since the still-in-market funds count toward the
+        // pool, so there is no dilution).
+        //
+        // `market_remaining` is read as the genesis market's collateral-vault
+        // balance, which equals the recoverable insurance+backing while no external
+        // positions are open on the genesis market — its `percolator_admin` proxy is
+        // locked until finalization, so no tradeable asset can be configured during
+        // the window. If the genesis market ever carries live trader margin this
+        // over-counts the pool, and the measure should instead read the insurance
+        // fund + backing buckets directly. (Flagged for review.)
+        if remaining > 0 {
+            let outstanding = cfg.outstanding_principal();
+            if outstanding == 0 {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let vault_balance = load_token_account(genesis_vault)?.amount;
+            let market_remaining = load_token_account(percolator_vault)?.amount;
+            let total_recoverable = vault_balance
+                .checked_add(market_remaining)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+            let payout_cap =
+                genesis_recoverable_principal(remaining, total_recoverable, outstanding)?;
+            let actual = core::cmp::min(payout_cap, vault_balance);
+            if actual > 0 {
+                let xfer_ix = spl_token::instruction::transfer(
+                    token_program.key,
+                    genesis_vault.key,
+                    user_base_ata.key,
+                    market_admin.key,
+                    &[],
+                    actual,
+                )?;
+                invoke_signed(
+                    &xfer_ix,
+                    &[
+                        genesis_vault.clone(),
+                        user_base_ata.clone(),
+                        market_admin.clone(),
+                        token_program.clone(),
+                    ],
+                    &[&signer_seeds],
+                )?;
+            }
+            // Retire the whole claim (not just the paid amount) so order can't matter
+            // and looping pays nothing; the unpaid shortfall is this depositor's
+            // realized share of the market loss.
             cfg.total_withdrawn = cfg
                 .total_withdrawn
-                .checked_add(actual)
+                .checked_add(remaining)
                 .ok_or(ProgramError::ArithmeticOverflow)?;
             pos.withdrawn = pos
                 .withdrawn
-                .checked_add(actual)
+                .checked_add(remaining)
                 .ok_or(ProgramError::ArithmeticOverflow)?;
         }
     }
